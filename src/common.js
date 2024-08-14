@@ -1,77 +1,70 @@
+// exec should be preferred as it is part of the toolkit but it doesn't support signal handling
+// https://github.com/actions/toolkit/issues/1534
+//const exec = require('@actions/exec') // https://github.com/actions/toolkit/tree/main/packages/exec
 const core = require('@actions/core') // https://github.com/actions/toolkit/tree/main/packages/core
-const exec = require('@actions/exec') // https://github.com/actions/toolkit/tree/main/packages/exec
 const process = require('process')
+const { spawn } = require("child_process");
 
 // read action inputs
 const input = {
-  run: core.getMultilineInput('run'),
-  post: core.getMultilineInput('post', {required: true}),
+  run: core.getInput('run'),
+  post: core.getInput('post'),
   workingDirectory: core.getInput('working-directory'),
   shell: core.getInput('shell'),
   postShell: core.getInput('post-shell'),
 }
 
-export async function run() {
-  return runCommands(joinMultilineCommands(input.run), input.shell)
+function run() {
+  return runCommands(input.run, input.shell)
 }
 
-export async function post() {
-  return runCommands(joinMultilineCommands(input.post), input.postShell ? input.postShell : input.shell)
+function post() {
+  return runCommands(input.post, input.postShell ? input.postShell : input.shell)
 }
 
-/**
- * @param {String[]} commands
- * @return {String[]}
- */
-function joinMultilineCommands(commands) {
-  const result = []
-  const re = /\\\s*$/
-  const buf = []
-
-  for (const cmd of commands) {
-    buf.push(cmd.replace(re, '')) // push command into buffer
-
-    if (!re.test(cmd)) { // if command not ends with \
-      result.push(buf.join(' ')) // join buffer and push into result
-
-      buf.length = 0 // clear buffer
-    }
-  }
-
-  return result
-}
-
-/**
- * @param {String[]} commands
- * @param {String} shell
- *
- * @return {Promise<void>}
- */
-async function runCommands(commands, shell) {
-  /** @type {import('@actions/exec/lib/interfaces').ExecOptions} */
+function runCommands(commands, shell) {
   const options = {
     cwd: input.workingDirectory,
     env: process.env,
-    silent: true,
-    listeners: {
-      stdline: (data) => core.info(data),
-      errline: (data) => core.info(data),
-    },
+    stdio: 'inherit',
+    shell: shell
   }
 
-  return (async () => {
-    for (const command of commands) {
-      if (command && command.trim() !== '') {
-        core.info(`\x1b[1m$ ${command}\x1b[0m`)
+  console.log(`Running commands in shell: ${shell}`);
+  console.log(`Commands:\n${commands}\n`);
 
-        const exitCode = shell === ''
-          ? await exec.exec(command, [], options)
-          : await exec.exec(shell, ['-c', command], options)
+  // The child process should handle any signals sent to the parent process so it can handle its shutdown.
+  // The parent process should not handle any signal otherwise it might send a signal twice to the child process or parent process (event loop) might terminate before the child process.
+  // https://github.com/nodejs/tooling/issues/42
+  const SIGNALS = ['SIGINT', 'SIGTERM', 'SIGQUIT', 'SIGHUP']
+  if (commands) {
+    core.info(`Starting new spawn process`);
+    const subprocess = spawn(commands, options)
+      .on('error', (error) => {
+        core.error(`Error: ${error.message}`);
+        process.exit(subprocess.exitCode);
+      });
+    core.info(`Child process with pid: ${subprocess.pid}`);
 
-        if (exitCode !== 0) {
-          core.setFailed(`Command failed with exit code ${exitCode}`)
-        }
-      }
-    }
-  })().catch(error => core.setFailed(error.message))
+    SIGNALS.forEach(signal => {
+      process.on(signal, () => {
+        core.info(`Child process will handle the signal: ${signal}`);
+        process.kill(subprocess.pid, signal);
+      });
+    });
+
+    // Set the child process exit code as the parent process exit code
+    ['close', 'exit'].forEach(event => {
+      subprocess.on(event, (code, signal) => {
+        core.info(`Child process ${event} with code ${code}`);
+        process.exit(code);
+      });
+    });
+
+  }
+}
+
+module.exports = {
+  run,
+  post
 }
